@@ -10,13 +10,41 @@ namespace MAPF {
         solver_name = PIBT::SOLVER_NAME;
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: PIBT Main Loop - Okumura et al. 2019]
+     * ===================================================================================
+     *
+     * Main planning loop that iteratively plans one timestep at a time until
+     * all agents reach their goals.
+     *
+     * PRIORITY COMPARATOR:
+     * Agents are processed in order of decreasing priority:
+     *   1. obs_d (higher = lower priority): Agents closer to obstacles get higher priority
+     *   2. elapsed (lower = higher priority): Agents not at goal get higher priority
+     *   3. init_d (lower = higher priority): Agents closer to goal get higher priority
+     *   4. tie_breaker: Random value for deterministic ordering
+     *
+     * This priority scheme ensures:
+     * - Agents near dynamic obstacles avoid collisions first
+     * - Agents that have been waiting longer get priority
+     * - Agents close to their goal can finish quickly
+     * ===================================================================================
+     */
     void PIBT::run() {
-        // compare priority of agents
+        /**
+         * PRIORITY COMPARATOR
+         * Returns true if agent 'a' has LOWER priority than agent 'b'
+         * (for min-heap, we want highest priority at top)
+         */
         auto compare = [](Agent *a, const Agent *b) {
+            /** Higher obs_d = further from obstacle = LOWER priority */
             if (a->obs_d != b->obs_d) return a->obs_d > b->obs_d;
+            /** Higher elapsed = been at goal longer = LOWER priority */
             if (a->elapsed != b->elapsed) return a->elapsed < b->elapsed;
-            // use initial distance
+            /** Higher init_d = further from goal = LOWER priority */
             if (a->init_d != b->init_d) return a->init_d < b->init_d;
+            /** Random tie-breaker for determinism */
             return a->tie_breaker < b->tie_breaker;
         };
 
@@ -114,26 +142,65 @@ namespace MAPF {
         }
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: Priority Inheritance with Backtracking - Core PIBT Function]
+     * ===================================================================================
+     *
+     * The heart of PIBT algorithm. For agent ai:
+     *
+     * 1. PLAN: Choose best next node v toward goal
+     * 2. CHECK CONFLICT: If v is occupied by agent aj
+     *    a. PRIORITY INHERITANCE: Recursively call funcPIBT(aj)
+     *       - Forces aj (lower priority) to move first
+     *       - aj inherits ai's priority temporarily
+     *    b. If aj successfully moves: ai can take v
+     *    c. If aj fails (stuck): BACKTRACK - ai chooses different node
+     * 3. SUCCESS: Return true when ai has a valid next node
+     * 4. FAILURE: Return false if no valid node exists (ai stays in place)
+     *
+     * KEY INSIGHT:
+     * Priority inheritance ensures that higher priority agents don't get
+     * blocked by lower priority agents indefinitely. Backtracking prevents
+     * deadlocks by allowing agents to reconsider their choices.
+     *
+     * @param ai Agent to plan for
+     * @return true if successfully found next node, false if stuck
+     * ===================================================================================
+     */
     bool PIBT::funcPIBT(Agent *ai) {
-        // decide next node
+        /** STEP 1: Plan next node toward goal */
         Node *v = planOneStep(ai);
+
         while (v != nullptr) {
             auto aj = occupied_now[v->id];
-            if (aj != nullptr) {  // someone occupies v
-                // avoid itself && allow rotations
+            if (aj != nullptr) {  // Conflict: node v is occupied by aj
+                /** Check if aj is different agent and hasn't planned yet */
                 if (aj != ai && aj->v_next == nullptr) {
-                    // do priority inheritance and backtracking
+                    /**
+                     * PRIORITY INHERITANCE:
+                     * Recursively call funcPIBT on aj, forcing it to move.
+                     * aj temporarily "inherits" ai's priority.
+                     */
                     if (!funcPIBT(aj)) {
-                        // replan
+                        /**
+                         * BACKTRACKING:
+                         * aj couldn't move, so ai must choose a different node.
+                         * planOneStep will return next best candidate.
+                         */
                         v = planOneStep(ai);
                         continue;
                     }
                 }
             }
-            // success to plan next one step
+            /** SUCCESS: ai can move to v */
             return true;
         }
-        // failed to secure node, cope stuck
+
+        /**
+         * FAILURE: No valid node found.
+         * Agent stays in current position (WAIT action).
+         */
         occupied_next[ai->v_now->id] = ai;
         ai->v_next = ai->v_now;
         return false;

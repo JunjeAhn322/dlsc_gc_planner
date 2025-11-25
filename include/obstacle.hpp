@@ -10,23 +10,85 @@
 #include <random>
 
 namespace MATP {
+    /**
+     * ===================================================================================
+     * [THEORY: Obstacle Data Structure - Park et al. 2023/2025]
+     * ===================================================================================
+     *
+     * Represents a dynamic obstacle or neighboring agent in the planning environment.
+     *
+     * KEY FIELDS:
+     * - position, velocity: Current state (from perception/LKF or communication)
+     * - radius: Physical collision radius
+     * - max_acc: Maximum acceleration capability (for RSFC inflation)
+     * - downwash: Vertical scaling factor for 3D collision model (UAV specific)
+     * - prev_traj: Previous planned trajectory (for cooperative agents)
+     *
+     * OBSTACLE TYPES:
+     * - AGENT: Cooperative robot sharing its trajectory
+     * - DYN_REAL: Real dynamic obstacle observed via sensors
+     * - DYN_SPIN/STRAIGHT/PATROL: Simulated obstacles with known motion patterns
+     * - DYN_CHASING: Reactive obstacle (pursuit behavior)
+     * - DYN_GAUSSIAN: Obstacle with random acceleration
+     * ===================================================================================
+     */
     struct Obstacle {
         ros::Time update_time;
         ObstacleType type = ObstacleType::DEFAULT;
         int id = -1;
-        double radius = 0;
-        double downwash = 0;
-        double max_acc = 0;
-        point3d position;
-        point3d velocity;
-        point3d goal_point;
+        double radius = 0;      ///< Physical collision radius r_0
+        double downwash = 0;    ///< Vertical scaling for ellipsoidal collision model
+        double max_acc = 0;     ///< Max acceleration for RSFC inflation formula
+        point3d position;       ///< Current position from perception/communication
+        point3d velocity;       ///< Current velocity from LKF/communication
+        point3d goal_point;     ///< Goal point (for cooperative agents)
         point3d observed_position;
-        Trajectory <point3d> prev_traj; //trajectory of obstacles planned at the previous step
+        Trajectory <point3d> prev_traj; ///< Previous trajectory (for trajectory sharing)
 
+        /**
+         * ===================================================================================
+         * [THEORY: Collision Check with Inflated Radius - Park et al. 2023, Section 4.1]
+         * ===================================================================================
+         *
+         * Checks if a given point would collide with this obstacle over a time horizon.
+         *
+         * ALGORITHM:
+         * For each time step t ∈ [0, horizon]:
+         * 1. Predict obstacle position: p_obs(t) = position + velocity * t
+         * 2. Compute inflated radius: r(t) = radius + 0.5 * a_max * t^2
+         *    (capped at uncertainty_horizon to prevent over-inflation)
+         * 3. Check collision: ||point - p_obs(t)|| < agent_radius + r(t)
+         *
+         * INFLATION FORMULA:
+         *   r(t) = r_0 + 0.5 * a_max * min(t, t_uncertainty)^2
+         *
+         * This accounts for worst-case deviation from constant velocity prediction.
+         *
+         * @param point          The point to check for collision
+         * @param agent_radius   Radius of the agent
+         * @param horizon        Time horizon for collision checking
+         * @param uncertainty_horizon  Time limit for radius inflation
+         * @return true if collision detected at any time in horizon
+         *
+         * [QUADRUPED ADAPTATION NOTE]:
+         * For 2D navigation, this reduces to circle-circle collision:
+         * - Ignore z-component or project to ground plane
+         * - Use 2D distance: sqrt(dx^2 + dy^2)
+         * ===================================================================================
+         */
         bool isCollided(const point3d &point, double agent_radius, double horizon, double uncertainty_horizon) const {
             for (double t = 0; t <= horizon; t += std::min(0.1 * horizon, 0.1)) {
+                /** Constant velocity prediction: p(t) = p_0 + v * t */
                 point3d obs_point = position + velocity * t;
+
+                /** Cap inflation time to uncertainty horizon */
                 double t_min = std::min(t, uncertainty_horizon);
+
+                /**
+                 * Inflated collision check:
+                 *   dist < agent_radius + obstacle_radius + inflation
+                 *   where inflation = 0.5 * a_max * t^2
+                 */
                 if (obs_point.distance(point) < agent_radius + radius + 0.5 * max_acc * t_min * t_min) {
                     return true;
                 }

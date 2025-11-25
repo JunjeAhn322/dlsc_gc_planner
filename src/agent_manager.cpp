@@ -116,9 +116,42 @@ namespace MATP {
         map_manager->publish();
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: Obstacle State Reception - Park et al. 2023/2025]
+     * ===================================================================================
+     *
+     * This callback is the OBSTACLE DATA ENTRY POINT to the planning pipeline.
+     * It receives obstacle information from the multi-agent coordination layer.
+     *
+     * OBSTACLE TYPES:
+     * - AGENT: Other cooperative agents (neighbors) - state from communication
+     * - DYN_REAL: Real dynamic obstacles - state from perception (LKF-filtered)
+     * - DYN_SIM: Simulated obstacles - state from simulation
+     * - STATIC: Static obstacles - handled separately via occupancy map
+     *
+     * DATA FLOW:
+     * 1. Receive obstacle list from coordination layer
+     * 2. For real dynamic obstacles: override with LKF-filtered state
+     *    (position + estimated velocity from CmdPublisher::listenTF)
+     * 3. Pass complete obstacle list to TrajPlanner for:
+     *    - Trajectory prediction (constant velocity model)
+     *    - Collision constraint generation (LSC/RSFC)
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation, obstacle z-coordinates and z-velocities can be ignored.
+     * Consider projecting 3D obstacles to 2D circles for constraint generation.
+     * ===================================================================================
+     */
     void AgentManager::obstacleCallback(const Obstacles &msg_obstacles) {
         Obstacles obstacles = msg_obstacles;
         if (param.multisim_experiment) {
+            /**
+             * [REAL OBSTACLE STATE INJECTION]
+             * Override simulated/communicated obstacle states with
+             * LKF-filtered states from real perception.
+             * This ensures trajectory prediction uses actual observed velocities.
+             */
             for (auto &obstacle: obstacles) {
                 if (obstacle.type == ObstacleType::DYN_REAL and
                     cmd_publisher->isObsPoseUpdated(obstacle.id)) {

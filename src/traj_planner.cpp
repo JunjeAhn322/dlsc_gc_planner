@@ -277,12 +277,47 @@ namespace MATP {
         }
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: Constant Velocity Trajectory Prediction - Park et al. 2023, Section 3.2]
+     * ===================================================================================
+     *
+     * Predicts future obstacle positions using the CONSTANT VELOCITY MODEL:
+     *
+     *   p_obs(t) = p_obs(0) + v_obs * t
+     *
+     * This is the simplest prediction model, assuming:
+     * - Obstacles maintain their current velocity
+     * - No acceleration or direction changes during the planning horizon
+     *
+     * The prediction is represented as a Bernstein polynomial trajectory with
+     * M segments, each of degree n, and duration dt.
+     *
+     * INPUT:
+     * - obstacles[oi].position: Current position from perception/LKF
+     * - obstacles[oi].velocity: Current velocity from perception/LKF
+     *
+     * OUTPUT:
+     * - obs_pred_trajs[oi]: Predicted trajectory over planning horizon [0, M*dt]
+     *
+     * USAGE:
+     * This predicted trajectory is used for:
+     * 1. Collision constraint generation (LSC/RSFC)
+     * 2. Dynamic Obstacle of Interest (DOI) detection
+     * 3. Safe corridor construction
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For pedestrians/vehicles, consider more sophisticated models:
+     * - Constant Turn Rate and Velocity (CTRV)
+     * - Social Force Model for pedestrians
+     * - Intent-based prediction using learned models
+     * ===================================================================================
+     */
     void TrajPlanner::obstaclePredictionWithCurrVel() {
-        // Obstacle prediction with constant velocity assumption
-        // It assumes that correct position and velocity are given
         size_t N_obs = obstacles.size();
         for (size_t oi = 0; oi < N_obs; oi++) {
             obs_pred_trajs[oi] = Trajectory<point3d>(param.M, param.n, param.dt);
+            /** planConstVelTraj generates: p(t) = position + velocity * t */
             obs_pred_trajs[oi].planConstVelTraj(obstacles[oi].position, obstacles[oi].velocity);
         }
     }
@@ -335,26 +370,87 @@ namespace MATP {
         }
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: RSFC Radius Inflation - Park et al. 2023, Section 4.1]
+     * ===================================================================================
+     *
+     * Computes the TIME-VARYING OBSTACLE RADIUS for RSFC (Relative Safe Flight Corridor).
+     *
+     * INFLATION FORMULA:
+     *   r(t) = r_0 + 0.5 * a_max * t^2
+     *
+     * where:
+     *   r_0    = Physical radius of the obstacle
+     *   a_max  = Maximum acceleration capability of the obstacle
+     *   t      = Time into the future
+     *
+     * PHYSICAL INTERPRETATION:
+     * Since we use constant velocity prediction, the obstacle could deviate from
+     * the predicted trajectory by accelerating. The worst-case deviation after
+     * time t is 0.5 * a_max * t^2 (kinematics). We "inflate" the collision model
+     * by this amount to guarantee safety even if the obstacle accelerates.
+     *
+     * BERNSTEIN REPRESENTATION:
+     * The quadratic inflation is converted to Bernstein polynomial control points
+     * for consistent representation with the trajectory optimization.
+     *
+     * UNCERTAINTY HORIZON:
+     * The inflation only applies up to obs_uncertainty_horizon. Beyond this,
+     * the radius is capped at its maximum value to prevent over-conservative
+     * constraints far into the future.
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation:
+     * - Use 2D circular inflation (ignore z-component)
+     * - Consider different a_max for different obstacle types:
+     *   * Pedestrians: ~1-2 m/s^2
+     *   * Vehicles: ~3-5 m/s^2
+     *   * Other robots: based on specifications
+     * ===================================================================================
+     */
     void TrajPlanner::obstacleSizePredictionWithConstAcc() {
+        /** Limit inflation to uncertainty horizon (prevents over-conservative constraints) */
         int M_uncertainty = std::min(static_cast<int>((param.obs_uncertainty_horizon + SP_EPSILON) / param.dt), param.M);
+
         for (size_t oi = 0; oi < obstacles.size(); oi++) {
             obs_pred_sizes[oi] = Trajectory<double>(param.M, param.n, param.dt);
+
             if (param.obs_size_prediction and (param.planner_mode == PlannerMode::RECIPROCALRSFC or
                                                obstacles[oi].type != ObstacleType::AGENT)) {
-                // Predict obstacle size using max acc
-                double max_acc;
-                max_acc = obstacles[oi].max_acc;
+                /**
+                 * INFLATE collision radius based on maximum acceleration.
+                 *
+                 * At segment m starting at time t_m = m * dt:
+                 *   r(t) = r_0 + 0.5 * a_max * t^2
+                 *
+                 * For Bernstein representation within segment [t_m, t_m + dt]:
+                 *   Local time s ∈ [0, dt]
+                 *   Global time t = t_m + s
+                 *   r(s) = r_0 + 0.5 * a_max * (t_m + s)^2
+                 *        = r_0 + 0.5 * a_max * t_m^2 + a_max * t_m * s + 0.5 * a_max * s^2
+                 *
+                 * Polynomial coefficients: [c_0, c_1*s, c_2*s^2]
+                 */
+                double max_acc = obstacles[oi].max_acc;
+
                 for (int m = 0; m < M_uncertainty; m++) {
                     Eigen::MatrixXd coef = Eigen::MatrixXd::Zero(1, param.n + 1);
+                    /** c_0: constant term = 0.5 * a_max * (m*dt)^2 */
                     coef(0, 0) = 0.5 * max_acc * pow(m * param.dt, 2);
+                    /** c_1: linear term = a_max * (m*dt) * dt */
                     coef(0, 1) = max_acc * m * param.dt * param.dt;
+                    /** c_2: quadratic term = 0.5 * a_max * dt^2 */
                     coef(0, 2) = 0.5 * max_acc * pow(param.dt, 2);
 
+                    /** Convert polynomial coefficients to Bernstein control points */
                     Eigen::MatrixXd control_points = coef * B_inv;
                     for (int i = 0; i < param.n + 1; i++) {
                         obs_pred_sizes[oi][m][i] = obstacles[oi].radius + control_points(0, i);
                     }
                 }
+
+                /** Beyond uncertainty horizon: cap at maximum inflation value */
                 for (int m = M_uncertainty; m < param.M; m++) {
                     for (int i = 0; i < param.n + 1; i++) {
                         obs_pred_sizes[oi][m][i] = obstacles[oi].radius +
@@ -362,6 +458,7 @@ namespace MATP {
                     }
                 }
             } else {
+                /** No inflation for cooperative agents (they share trajectories) */
                 obs_pred_sizes[oi].planConstVelTraj(obstacles[oi].radius, 0);
             }
         }
@@ -524,6 +621,42 @@ namespace MATP {
         }
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: Reciprocal RSFC Generation - Park et al. 2023, Section 4.3]
+     * ===================================================================================
+     *
+     * Generates Relative Safe Flight Corridor (RSFC) constraints for dynamic obstacles
+     * using the "reciprocal" approach - both agents share collision avoidance burden.
+     *
+     * RSFC CONCEPT:
+     * For dynamic obstacles with uncertain motion, we construct a tangent plane to the
+     * "inflated collision model" rather than using convex hull separation (GJK).
+     *
+     * ALGORITHM:
+     * For each obstacle and time segment:
+     * 1. Compute line paths for obstacle and agent trajectories
+     * 2. Find closest points between the two lines
+     * 3. Normal vector: points from obstacle line to agent line
+     * 4. Safety margin d:
+     *    - Non-reciprocal: d = r_obs(t) + r_agent (full margin)
+     *    - Reciprocal (for agents): d = 0.5 * (r_obs + r_agent + closest_dist)
+     *      (shared responsibility - each takes half the avoidance)
+     *
+     * INFLATED RADIUS:
+     *   r_obs(t) = r_0 + 0.5 * a_max * t^2
+     * from obstacleSizePredictionWithConstAcc()
+     *
+     * DOWNWASH:
+     * The downwash factor scales z-component for UAVs to create ellipsoidal collision.
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D ground robots:
+     * - Remove downwash scaling (or set to 1.0)
+     * - Use 2D line-line distance
+     * - Normal vector is purely in x-y plane
+     * ===================================================================================
+     */
     void TrajPlanner::generateReciprocalRSFC() {
         double closest_dist;
         point3d normal_vector;
@@ -531,13 +664,21 @@ namespace MATP {
         for (int oi = 0; oi < obstacles.size(); oi++) {
             double downwash = downwashBetween(oi);
             for (int m = 0; m < param.M; m++) {
+                /** Line paths for this segment: start to end control points */
                 Line obs_path(obs_pred_trajs[oi][m][0], obs_pred_trajs[oi][m][param.n]);
                 Line agent_path(initial_traj[m][0], initial_traj[m][param.n]);
+
+                /** Normal vector from closest point computation between lines */
                 normal_vector = normalVectorBetweenLines(obs_path, agent_path, closest_dist);
                 normal_vector.z() = normal_vector.z() / (downwash * downwash);
 
                 for (int i = 0; i < param.n + 1; i++) {
                     double d;
+                    /**
+                     * RECIPROCAL MARGIN:
+                     * If agents are close (overlap), share the avoidance burden
+                     * d = 0.5 * (r_obs + r_agent + dist) instead of d = r_obs + r_agent
+                     */
                     if (obstacles[oi].type == ObstacleType::AGENT and
                         closest_dist < obs_pred_sizes[oi][m][i] + agent.radius) {
                         d = 0.5 * (obs_pred_sizes[oi][m][i] + agent.radius + closest_dist);
@@ -600,26 +741,70 @@ namespace MATP {
         }
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: DLSC-GC Constraint Generation - Park et al. 2025]
+     * ===================================================================================
+     *
+     * Generates Deadlock-Free Linear Safe Corridor (DLSC) constraints with
+     * Guaranteed Convergence (GC) via goal-based separation.
+     *
+     * KEY INNOVATION (DLSC-GC):
+     * Unlike standard LSC that only considers current trajectory segments,
+     * DLSC-GC includes GOAL-BASED CONSTRAINTS at the final segment to ensure:
+     * 1. No deadlock: agents can always make progress toward goals
+     * 2. Convergence: agents will eventually reach their goals
+     *
+     * CONSTRAINT TYPES:
+     * 1. DYNAMIC OBSTACLES (type != AGENT):
+     *    - Use tangent plane to inflated collision model (RSFC approach)
+     *    - Normal vector from normalVectorDynamicObs()
+     *
+     * 2. COOPERATIVE AGENTS (type == AGENT), segments m < M-1:
+     *    - Use GJK algorithm for convex hull separation
+     *    - Normal vector from normalVectorBetweenPolys()
+     *    - Safety margin: d = 0.5 * (collision_dist + projection)
+     *
+     * 3. GOAL-BASED SEPARATION (final segment M-1):
+     *    - Compute separation based on line from current position to goal
+     *    - Ensures agents don't block each other's paths to goals
+     *    - This is the "GC" (Guaranteed Convergence) component
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation:
+     * - Downwash = 1.0 (no vertical ellipsoid scaling)
+     * - GJK operates in 2D (ignore z-component)
+     * - Goal separation is also in 2D plane
+     * ===================================================================================
+     */
     void TrajPlanner::generateDLSCGC() {
         for (int oi = 0; oi < obstacles.size(); oi++) {
             double collision_dist = obstacles[oi].radius + agent.radius;
 
-            // Coordinate transformation
+            /**
+             * COORDINATE TRANSFORMATION:
+             * Scale z-axis by downwash factor to convert sphere to ellipsoid.
+             * This accounts for UAV downwash effects on vertical separation.
+             */
             double downwash = downwashBetween(oi);
             traj_t initial_traj_trans = initial_traj.coordinateTransform(downwash);
             traj_t obs_pred_traj_trans = obs_pred_trajs[oi].coordinateTransform(downwash);
             point3d obs_goal_trans = coordinateTransform(obstacles[oi].goal_point, downwash);
             point3d agent_goal_trans = coordinateTransform(agent.current_goal_point, downwash);
 
-            // Generate LSC
+            /** Generate LSC for each trajectory segment */
             for (int m = 0; m < param.M; m++) {
+                /**
+                 * CASE 1: DYNAMIC OBSTACLES
+                 * Use tangent plane to inflated collision sphere (RSFC approach)
+                 */
                 if(obstacles[oi].type != ObstacleType::AGENT){
                     point3d normal_vector_trans = normalVectorDynamicObs(oi, m, downwash);
                     point3d normal_vector(normal_vector_trans.x(),
                                           normal_vector_trans.y(),
                                           normal_vector_trans.z() / downwash);
 
-                    // Compute safety margin
+                    /** Safety margin = inflated obstacle radius + agent radius */
                     for (int i = 0; i < param.n + 1; i++) {
                         double d = obs_pred_sizes[oi][m][i] + agent.radius;
                         LSC lsc(obs_pred_trajs[oi][m][i], normal_vector, d);
@@ -1099,20 +1284,65 @@ namespace MATP {
         return normal_vector;
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: GJK-based Normal Vector for LSC - Park et al. 2023, Section 4.2]
+     * ===================================================================================
+     *
+     * Computes the separation hyperplane normal between agent and obstacle
+     * trajectory control points using the GJK (Gilbert-Johnson-Keerthi) algorithm.
+     *
+     * ALGORITHM:
+     * 1. Compute RELATIVE CONTROL POINTS:
+     *    rel_i = agent_control_point_i - obstacle_control_point_i
+     *
+     * 2. Form convex hull of relative control points (Minkowski difference)
+     *
+     * 3. Find closest point on convex hull to origin using GJK:
+     *    - If origin is OUTSIDE hull: trajectories don't collide
+     *    - If origin is INSIDE hull: trajectories may collide
+     *
+     * 4. Normal vector = direction from origin to closest point
+     *    This is the direction that separates the two trajectory segments
+     *
+     * GEOMETRIC INTERPRETATION:
+     * The convex hull of relative control points represents the Minkowski sum
+     * of the agent trajectory and the negated obstacle trajectory. Finding the
+     * closest point to origin gives the optimal separation direction.
+     *
+     * LSC CONSTRAINT:
+     *   n · (agent_ctrl_pt - obs_ctrl_pt) - d >= 0
+     * where n is the computed normal vector
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation:
+     * - Set z-component of relative points to 0
+     * - GJK operates in 2D plane
+     * - Normal vector has only x and y components
+     * ===================================================================================
+     */
     point3d TrajPlanner::normalVectorBetweenPolys(int oi, int m,
                                                   const traj_t &initial_traj_trans,
                                                   const traj_t &obs_pred_traj_trans) {
         size_t n_control_points = param.n + 1;
+
+        /** Compute relative control points (Minkowski difference) */
         point3ds control_points_rel(n_control_points);
         for (size_t i = 0; i < n_control_points; i++) {
             control_points_rel[i] = initial_traj_trans[m][i] - obs_pred_traj_trans[m][i];
 
+            /** For high-downwash obstacles, ignore z-component (2D separation) */
             if (obstacles[oi].type != ObstacleType::AGENT and
                 obstacles[oi].downwash > param.obs_downwash_threshold) {
                 control_points_rel[i].z() = 0;
             }
         }
 
+        /**
+         * GJK Algorithm:
+         * Find closest point on convex hull of relative points to origin.
+         * The direction from origin to closest point is the separation normal.
+         */
         ClosestPoints closest_points = closestPointsBetweenPointAndConvexHull(point3d(0, 0, 0),
                                                                               control_points_rel);
         point3d normal_vector = closest_points.closest_point2.normalized();
@@ -1126,15 +1356,44 @@ namespace MATP {
         return normal_vector;
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: Tangent Plane Normal for Dynamic Obstacles - Park et al. 2023]
+     * ===================================================================================
+     *
+     * Computes the separation normal for dynamic (non-cooperative) obstacles
+     * using the tangent plane approach for RSFC.
+     *
+     * Unlike GJK for cooperative agents, dynamic obstacles use a simpler
+     * approach based on the agent's goal direction:
+     *
+     * NORMAL VECTOR SELECTION:
+     * 1. If goal direction and current direction are aligned:
+     *    Normal = direction from obstacle to agent (simple repulsion)
+     * 2. Otherwise:
+     *    Normal = direction toward goal (guides agent around obstacle)
+     *
+     * This creates a "tangent plane" to the inflated collision sphere that:
+     * - Separates agent from obstacle
+     * - Guides agent toward its goal
+     * - Accounts for obstacle uncertainty via inflated radius r(t)
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation:
+     * - z-component is set to 0 for high-downwash obstacles
+     * - Normal vector is purely in x-y plane
+     * ===================================================================================
+     */
     point3d TrajPlanner::normalVectorDynamicObs(int oi, int m, double downwash) {
         point3d normal_vector;
 
-        //Coordinate transformation
+        /** Transform vectors to downwash-scaled coordinate system */
         point3d vector_obs_to_goal = coordinateTransform(agent.current_goal_point - obstacles[oi].position,
                                                          downwash);
         point3d vector_obs_to_agent = coordinateTransform(agent.current_state.position - obstacles[oi].position,
                                                           downwash);
-        // Ignore z axis if obstacle's downwash is too big
+
+        /** For 2D/planar separation with high-downwash obstacles */
         if (obstacles[oi].downwash > param.obs_downwash_threshold) {
             vector_obs_to_goal.z() = 0;
             vector_obs_to_agent.z() = 0;

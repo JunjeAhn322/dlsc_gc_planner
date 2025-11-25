@@ -1,11 +1,44 @@
-/*
- * Implementation of Priority Inheritance with Backtracking (PIBT)
+/**
+ * ===================================================================================
+ * [THEORY: PIBT - Priority Inheritance with Backtracking]
+ * ===================================================================================
  *
- * - ref
- * Okumura, K., Machida, M., Défago, X., & Tamura, Y. (2019).
- * Priority Inheritance with Backtracking for Iterative Multi-agent Path
- * Finding. In Proceedings of the Twenty-Eighth International Joint Conference
- * on Artificial Intelligence (pp. 535–542).
+ * Implementation based on:
+ * Okumura, K., Machida, M., Défago, X., & Tamura, Y. (IJCAI 2019).
+ * "Priority Inheritance with Backtracking for Iterative Multi-agent Path Finding"
+ *
+ * ALGORITHM OVERVIEW:
+ * PIBT is a decentralized, real-time MAPF algorithm that:
+ * 1. Assigns priorities to agents dynamically
+ * 2. Uses PRIORITY INHERITANCE to resolve conflicts
+ * 3. Uses BACKTRACKING when priority inheritance fails
+ *
+ * KEY CONCEPT - DEADLOCK RESOLUTION (Park et al. 2023/2025):
+ * In the DLSC-GC framework, PIBT generates discrete waypoints that guide the
+ * continuous trajectory optimization. This prevents deadlocks that can occur
+ * when multiple agents have conflicting goals.
+ *
+ * PRIORITY ORDERING:
+ * Agents are sorted by:
+ * 1. obs_d: Distance to closest dynamic obstacle (higher priority if closer)
+ * 2. elapsed: Time spent at goal (lower elapsed = higher priority)
+ * 3. init_d: Initial distance to goal (shorter = higher priority)
+ * 4. tie_breaker: Random value to break ties
+ *
+ * ALGORITHM STEPS:
+ * 1. Sort agents by priority
+ * 2. For highest priority agent, choose next node toward goal
+ * 3. If node occupied by lower priority agent:
+ *    - PRIORITY INHERITANCE: force lower priority agent to move first
+ *    - If fails: BACKTRACK and choose different node
+ * 4. If no valid node: stay in place
+ *
+ * [QUADRUPED ADAPTATION NOTE]:
+ * For 2D navigation, the grid is a 2D lattice. Priority can be adjusted based on:
+ * - Distance to dynamic obstacles (pedestrians, vehicles)
+ * - Robot's payload or mission criticality
+ * - Battery level or operational constraints
+ * ===================================================================================
  */
 
 #pragma once
@@ -17,38 +50,46 @@ namespace MAPF {
         static const std::string SOLVER_NAME;
 
     private:
-        // PIBT agent
+        /**
+         * PIBT Agent structure containing state and priority information.
+         */
         struct Agent {
-            int id;
-            Node *v_now;        // current location
-            Node *v_next;       // next location
-            Node *g;            // goal
-            Node *o;            // closest obstacle
-            int elapsed;        // eta
-            int init_d;         // initial distance
-            float tie_breaker;  // epsilon, tie-breaker
-            float obs_d;        // distance to obstacle
+            int id;              ///< Unique agent identifier
+            Node *v_now;         ///< Current grid node location
+            Node *v_next;        ///< Planned next grid node (nullptr if not yet decided)
+            Node *g;             ///< Goal grid node
+            Node *o;             ///< Closest dynamic obstacle grid node (for DOI handling)
+            int elapsed;         ///< Timesteps spent at goal (for priority adjustment)
+            int init_d;          ///< Initial distance to goal (for tie-breaking)
+            float tie_breaker;   ///< Random tie-breaker for deterministic ordering
+            float obs_d;         ///< Distance to closest dynamic obstacle
         };
         using Agents = std::vector<Agent *>;
 
-        // <node-id, agent>, whether the node is occupied or not
-        // work as reservation table
+        /**
+         * Reservation tables for collision avoidance.
+         * occupied_now: which agent is at each node at current timestep
+         * occupied_next: which agent will be at each node at next timestep
+         */
         Agents occupied_now;
         Agents occupied_next;
 
-        // option
         bool disable_dist_init = false;
 
-        // result of priority inheritance: true -> valid, false -> invalid
+        /**
+         * Core PIBT function with Priority Inheritance and Backtracking.
+         * @param ai Agent to plan for
+         * @return true if successfully planned, false if stuck
+         */
         bool funcPIBT(Agent *ai);
 
-        // plan next node
+        /** Plan one step toward goal, considering reservations */
         Node *planOneStep(Agent *a);
 
-        // chose one node from candidates, used in planOneStep
+        /** Choose best node from candidates based on distance heuristics */
         Node *chooseNode(Agent *a);
 
-        // main
+        /** Main PIBT loop */
         void run();
 
     public:
@@ -60,6 +101,7 @@ namespace MAPF {
 
         static void printHelp();
 
+        /** Compute Euclidean distance from agent's obstacle to a node */
         static float obsDist(Agent *a, Node* s);
     };
 }

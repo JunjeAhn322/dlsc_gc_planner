@@ -14,8 +14,36 @@
 #include <convhull_3d/convhull_3d.h>
 
 namespace MATP {
-    // Linear Safe Corridor
-    // LSC = {c \in R^3 | (c - c_obs).dot(normal_vector) - d > 0}
+    /**
+     * ===================================================================================
+     * [THEORY: Linear Safe Corridor (LSC) - Park et al. 2023/2025, Section 4]
+     * ===================================================================================
+     *
+     * LSC defines a half-space constraint that separates the agent from an obstacle.
+     *
+     * MATHEMATICAL DEFINITION:
+     *   LSC = {c ∈ R³ | (c - c_obs) · n - d > 0}
+     *
+     * where:
+     *   c       = trajectory control point (decision variable)
+     *   c_obs   = obstacle reference point (control point on obstacle trajectory)
+     *   n       = separation hyperplane normal vector (points toward agent)
+     *   d       = safety margin (collision distance)
+     *
+     * GEOMETRIC INTERPRETATION:
+     * The LSC defines a half-plane that the agent must stay on. The normal vector
+     * points away from the obstacle toward the agent's safe region.
+     *
+     * TYPES OF LSC IN THIS IMPLEMENTATION:
+     * 1. LSC for agents (DLSC-GC): GJK-based normal vector for convex hull separation
+     * 2. RSFC for dynamic obstacles: Tangent plane to inflated collision sphere
+     * 3. BVC (Buffered Voronoi Cell): Voronoi-based separation (simpler variant)
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation, LSC becomes a half-plane in 2D:
+     *   {(x,y) | (x-x_obs)*n_x + (y-y_obs)*n_y - d > 0}
+     * ===================================================================================
+     */
     class LSC {
     public:
         LSC() = default;
@@ -27,29 +55,59 @@ namespace MATP {
         [[nodiscard]] visualization_msgs::Marker convertToMarker(double agent_radius,
                                                                  const std::string &world_frame_id) const;
 
+        /** Check if a point satisfies this LSC constraint */
         bool isPointInLSC(const point3d &point) const;
 
-        point3d obs_control_point;
-        point3d normal_vector;
-        double d = 0;
+        point3d obs_control_point;  ///< Reference point on obstacle trajectory c_obs
+        point3d normal_vector;       ///< Separation hyperplane normal n (unit vector toward agent)
+        double d = 0;                ///< Safety margin (collision distance r_agent + r_obs)
     };
 
     typedef std::vector<LSC> LSCs;
 
+    /**
+     * Container for all dynamic obstacle constraints across the planning horizon.
+     * Stores LSC[obstacle_idx][segment_idx][control_point_idx].
+     */
     class DynamicConstraints {
     public:
         DynamicConstraints() = default;
-        int N_obs = 0;
-        ObstacleTypes types;
-        point3ds obs_positions;
-        std::vector<std::vector<std::vector<LSC>>> constraints; // [obs_idx][segment_idx][control_pts_idx]
+        int N_obs = 0;                    ///< Number of obstacles (agents + dynamic obs)
+        ObstacleTypes types;              ///< Type of each obstacle (AGENT, DYN_REAL, etc.)
+        point3ds obs_positions;           ///< Current positions of obstacles
+        std::vector<std::vector<std::vector<LSC>>> constraints; ///< [obs_idx][segment_idx][ctrl_pt_idx]
 
         void initialize(int N_obs_, int M, int n);
         LSC getLSC(int oi, int m, int i);
     };
 
-    // Axis aligned bounding box
-    // Box = {c \in R^3 | box_min < |c| < box_max}
+    /**
+     * ===================================================================================
+     * [THEORY: Static Flight Corridor (SFC) - Park et al. 2023/2025]
+     * ===================================================================================
+     *
+     * SFC defines an axis-aligned bounding box (AABB) that is free of static obstacles.
+     * The agent's trajectory must stay within the SFC to avoid static collisions.
+     *
+     * MATHEMATICAL DEFINITION:
+     *   SFC = {c ∈ R³ | box_min < c < box_max}
+     *
+     * Equivalent to 6 half-plane constraints:
+     *   c_x > box_min_x,  c_x < box_max_x
+     *   c_y > box_min_y,  c_y < box_max_y
+     *   c_z > box_min_z,  c_z < box_max_z
+     *
+     * SFC CONSTRUCTION (Axis Search Method):
+     * 1. Start with a small AABB containing the agent's current position
+     * 2. Expand in each axis direction until hitting a static obstacle
+     * 3. The resulting box is the largest obstacle-free region
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation, SFC becomes a rectangle:
+     *   {(x,y) | x_min < x < x_max, y_min < y < y_max}
+     * The z dimension can be ignored or fixed to terrain height.
+     * ===================================================================================
+     */
     class Box {
     public:
         point3d box_min;

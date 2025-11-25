@@ -1020,44 +1020,88 @@ namespace MATP {
 //        return true;
 //    }
 
+    /**
+     * ===================================================================================
+     * [THEORY: SFC Incremental Axis Expansion - Park et al. 2023/2025]
+     * ===================================================================================
+     *
+     * Constructs a Static Flight Corridor (SFC) by incrementally expanding an
+     * axis-aligned bounding box in all 6 directions until hitting obstacles.
+     *
+     * ALGORITHM:
+     * 1. Start with initial AABB containing the seed point(s)
+     * 2. Expand in each of 6 directions: {-x, -y, -z, +x, +y, +z}
+     * 3. For each direction:
+     *    a. Extend box by one grid resolution
+     *    b. Check if new region contains obstacles (via distance map)
+     *    c. If obstacle found: stop expanding in this direction
+     *    d. If no obstacle: continue expanding
+     * 4. Stop when all directions are blocked or max iteration reached
+     *
+     * COLLISION CHECK:
+     * Uses Euclidean Distance Transform (EDT) map for efficient collision checking.
+     * A cell is "occupied" if dist_to_obstacle < margin (agent_radius).
+     *
+     * MARGIN COMPENSATION:
+     * After expansion, apply margin compensation to ensure the actual trajectory
+     * (with agent radius) stays collision-free.
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation, only expand in 4 directions: {-x, -y, +x, +y}.
+     * The z dimension is handled by terrain height map or fixed.
+     *
+     * @param sfc_initial Initial AABB to expand from
+     * @param margin Safety margin (typically agent_radius)
+     * @param sfc_expand Output: expanded SFC
+     * @return true if successful, false if initial box contains obstacle
+     * ===================================================================================
+     */
     bool CollisionConstraints::expandSFCIncrementally(const Box &sfc_initial, double margin, Box &sfc_expand) {
+        /** Check if initial box is already in collision */
         if (isObstacleInSFC(sfc_initial, margin)) {
             return false;
         }
 
         Box sfc, sfc_cand, sfc_update;
-        std::vector<int> axis_cand = {0, 1, 2, 3, 4, 5}; // -x, -y, -z, +x, +y, +z
+        /** 6 expansion directions: 0=-x, 1=-y, 2=-z, 3=+x, 4=+y, 5=+z */
+        std::vector<int> axis_cand = {0, 1, 2, 3, 4, 5};
 
+        /** Limit expansion to prevent overly large SFCs */
         int max_iter = (int)round(std::max(2 * param.grid_resolution, agent_max_vel * param.dt) / param.world_resolution) + 1;
-//        int max_iter = SP_INFINITY;
         std::vector<int> axis_iter = {0, 0, 0, 0, 0, 0};
 
         int i = -1;
         int axis;
         sfc = sfc_initial;
+
+        /** Main expansion loop: continue until all directions blocked */
         while (!axis_cand.empty()) {
-            // initialize boxes
             sfc_cand = sfc;
             sfc_update = sfc;
 
-            //check collision update_box only! box_current + box_update = box_cand
+            /**
+             * Inner loop: expand in current direction until obstacle or boundary hit.
+             * Only check the newly expanded region (sfc_update) for efficiency.
+             */
             while (isSFCInBoundary(sfc_update, 0) && !isObstacleInSFC(sfc_update, margin)) {
                 i++;
                 if (i >= axis_cand.size()) {
-                    i = 0;
+                    i = 0;  // Cycle through directions
                 }
                 axis = axis_cand[i];
 
-                //update current box
+                /** Update confirmed expansion */
                 sfc = sfc_cand;
                 sfc_update = sfc_cand;
 
-                //expand box_cand and get updated part of box (box_update)
+                /** Expand by one grid resolution in current direction */
                 if (axis < 3) {
+                    /** Negative direction: decrease box_min */
                     sfc_update.box_max(axis) = sfc_cand.box_min(axis);
                     sfc_cand.box_min(axis) = sfc_cand.box_min(axis) - param.world_resolution;
                     sfc_update.box_min(axis) = sfc_cand.box_min(axis);
                 } else {
+                    /** Positive direction: increase box_max */
                     sfc_update.box_min(axis - 3) = sfc_cand.box_max(axis - 3);
                     sfc_cand.box_max(axis - 3) = sfc_cand.box_max(axis - 3) + param.world_resolution;
                     sfc_update.box_max(axis - 3) = sfc_cand.box_max(axis - 3);
@@ -1065,10 +1109,11 @@ namespace MATP {
 
                 axis_iter[axis] = axis_iter[axis] + 1;
                 if(axis_iter[axis] > max_iter){
-                    break;
+                    break;  // Max expansion reached in this direction
                 }
             }
-            // if obstacle is in box then do not expand box to the current axis direction
+
+            /** Obstacle hit: remove this direction from candidates */
             axis_cand.erase(axis_cand.begin() + i);
             if (i > 0) {
                 i--;
@@ -1077,7 +1122,11 @@ namespace MATP {
             }
         }
 
-        //SFC margin compensation
+        /**
+         * MARGIN COMPENSATION:
+         * Adjust SFC boundaries to account for discretization error.
+         * This ensures the agent (with radius = margin) stays collision-free.
+         */
         double delta = margin - ((int) (margin / param.world_resolution) * param.world_resolution);
         for (int k = 0; k < 3; k++) {
             if (sfc.box_min(k) > mission.world_min(k) + SP_EPSILON_FLOAT) {

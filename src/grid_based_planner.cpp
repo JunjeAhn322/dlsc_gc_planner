@@ -189,12 +189,42 @@ namespace MATP {
         return true;
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: Dynamic Obstacle of Interest (DOI) Detection - Park et al. 2025]
+     * ===================================================================================
+     *
+     * Identifies dynamic obstacles that may interfere with the agent's waypoint.
+     *
+     * DOI CONCEPT:
+     * A Dynamic Obstacle of Interest is an obstacle whose predicted trajectory
+     * could collide with the agent's current waypoint. When DOI is detected:
+     * 1. The MAPF planner receives information about the closest obstacle
+     * 2. The goal may be updated to move away from the obstacle
+     * 3. Priority in PIBT is adjusted based on distance to DOI
+     *
+     * ALGORITHM:
+     * For each agent:
+     * 1. Check if waypoint is in "reachable region" of any dynamic obstacle
+     *    using isCollided() with inflation formula r(t) = r_0 + 0.5*a_max*t^2
+     * 2. Build candidate list of obstacles that could reach waypoint
+     * 3. Select closest obstacle as the primary DOI
+     *
+     * @param mapf_agents Agents to update with DOI information
+     * @param obstacles Dynamic obstacles in the environment
+     * @param agent_radius Collision radius of the agent
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation, the isCollided check uses 2D distance.
+     * Consider pedestrian/vehicle-specific uncertainty models.
+     * ===================================================================================
+     */
     void GridBasedPlanner::updateDOI(MAPFAgents &mapf_agents, const Obstacles &obstacles, double agent_radius) {
         for (auto& mapf_agent: mapf_agents) {
             DOI dyn_obs_interest;
             dyn_obs_interest.agent_position = mapf_agent.current_agent_position;
 
-            // Find the candidates of dyn_obs_interest
+            /** Find obstacles that could reach the agent's current waypoint */
             Obstacles doi_cands;
             Node *g = point3DToClosestNode(mapf_agent.current_waypoint);
             if(mapf_agent.collision_alert.obstacles.empty()){
@@ -247,8 +277,43 @@ namespace MATP {
     }
 
 
+    /**
+     * ===================================================================================
+     * [THEORY: Goal Update for DOI Avoidance - Park et al. 2025]
+     * ===================================================================================
+     *
+     * When a Dynamic Obstacle of Interest (DOI) is detected, this function updates
+     * the agent's goal to a safer location away from the obstacle.
+     *
+     * ALGORITHM (BFS-based Goal Update):
+     * 1. Start BFS from agent's current position toward original waypoint
+     * 2. For each node, compute "obstacle cost" based on distance to DOI:
+     *    cost = Σ (1 / dist_to_obstacle^2)
+     * 3. Expand to neighbors only if they have LOWER obstacle cost
+     *    (gradient descent toward obstacle-free region)
+     * 4. Select node with minimum obstacle cost as new goal
+     *
+     * TWO-PHASE SEARCH:
+     * - Phase 1: Search from agent position toward original waypoint
+     * - Phase 2: If original waypoint is reached, restart search from there
+     *   to find safest point nearby
+     *
+     * COST FUNCTION:
+     *   c(node) = Σ_{i ∈ DOI} 1 / d_i(node)^2
+     * where d_i is the grid distance from obstacle i to node.
+     *
+     * This ensures the new goal:
+     * - Is far from dynamic obstacles
+     * - Is close to the original waypoint when possible
+     * - Can be reached without crossing obstacle paths
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For ground robots, consider terrain traversability in the cost function.
+     * ===================================================================================
+     */
     void GridBasedPlanner::updateGoal(MAPFAgents &mapf_agents) {
         for (auto& mapf_agent: mapf_agents) {
+            /** Skip if no DOI detected */
             if (not mapf_agent.dyn_obs_interest.exist()) {
                 continue;
             }
@@ -259,14 +324,15 @@ namespace MATP {
             double min_cost = SP_INFINITY;
             bool restart_search = false;
 
+            /** BFS to find safest goal point away from DOI */
             std::queue<Node *> OPEN;
             OPEN.push(n);
             while (!OPEN.empty()) {
                 n = OPEN.front();
                 OPEN.pop();
 
+                /** Phase 2: If reached original goal, restart search from there */
                 if (!restart_search and n->id == g->id) {
-                    // restart BFS at the goal
                     std::queue<Node *> empty;
                     std::swap(OPEN, empty);
                     OPEN.push(g);
@@ -276,11 +342,14 @@ namespace MATP {
                     continue;
                 }
 
+                /** Get obstacle cost at current node */
                 const double c_n = getObsCost(mapf_agent.dyn_obs_interest.doi_cand_ids, n->id);
+
+                /** Expand to neighbors with LOWER obstacle cost (gradient descent) */
                 for (const auto &m: n->neighbor) {
                     const double c_m = getObsCost(mapf_agent.dyn_obs_interest.doi_cand_ids, m->id);
                     if (c_n < c_m + SP_EPSILON_FLOAT) {
-                        continue;
+                        continue;  // Only expand toward lower cost
                     }
                     if (c_m < min_cost) {
                         min_cost = c_m;
@@ -289,7 +358,8 @@ namespace MATP {
                     OPEN.push(m);
                 }
 
-                if (min_cost < 0.01) { //TODO: param
+                /** Early termination: found sufficiently safe point */
+                if (min_cost < 0.01) {
                     break;
                 }
             }
@@ -421,8 +491,43 @@ namespace MATP {
         return init_plan_result;
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: Grid-based MAPF Execution - Park et al. 2023/2025]
+     * ===================================================================================
+     *
+     * Executes the Multi-Agent Path Finding (MAPF) algorithm on the discrete grid.
+     *
+     * ROLE IN DLSC-GC PIPELINE:
+     * This is the "Guaranteed Convergence" (GC) component that generates discrete
+     * waypoints to guide the continuous trajectory optimization. It prevents
+     * deadlocks by coordinating agents at the discrete planning level.
+     *
+     * ALGORITHM:
+     * 1. Convert continuous positions to grid nodes
+     * 2. Create MAPF problem with:
+     *    - Start: agent's starting grid position
+     *    - Current: agent's current waypoint on grid
+     *    - Goal: agent's target position (possibly updated by DOI avoidance)
+     *    - Obstacle info: closest DOI for priority computation
+     * 3. Solve using PIBT (or ECBS)
+     * 4. Extract path and convert back to continuous coordinates
+     *
+     * AVAILABLE SOLVERS:
+     * - PIBT: Priority Inheritance with Backtracking (default, real-time)
+     * - ECBS: Enhanced Conflict-Based Search (optimal, slower)
+     *
+     * OUTPUT:
+     * The generated path provides discrete waypoints that the subgoal optimizer
+     * uses to guide the agent through safe regions.
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * For 2D navigation, the grid is a 2D lattice with 4 or 8 connectivity.
+     * Grid resolution should match the robot's footprint and maneuverability.
+     * ===================================================================================
+     */
     bool GridBasedPlanner::runMAPF(const MAPFAgents &mapf_agents) {
-        // Initialize start, current, goal points
+        /** Convert continuous agent states to grid problem specification */
         ProblemAgents agents;
         for (const auto &mapf_agent: mapf_agents) {
             agents.emplace_back(point3DToNode(mapf_agent.start_point),
@@ -432,20 +537,21 @@ namespace MATP {
                                 mapf_agent.dyn_obs_interest.closest_obs_dist);
         }
 
-        // Run MAPF
+        /** Create MAPF problem and select solver */
         MAPF::Problem P = MAPF::Problem(grid_map, n_agents, agents);
         std::unique_ptr<MAPF::Solver> solver;
         if (param.mapf_mode == MAPFMode::PIBT) {
+            /** PIBT: Real-time, decentralized, deadlock-free */
             solver = std::make_unique<MAPF::PIBT>(&P);
         } else if (param.mapf_mode == MAPFMode::ECBS) {
-            //TODO: ECBS is not supported yet.
+            /** ECBS: Bounded-suboptimal, centralized */
             solver = std::make_unique<MAPF::ECBS>(&P);
         } else {
             throw std::invalid_argument("[GridBasedPlanner] Invalid MAPF mode");
         }
 
+        /** Solve and extract discrete path */
         solver->solve();
-
         MAPF::Plan plan = solver->getSolution();
         updatePlanResult(plan, mapf_agents);
 

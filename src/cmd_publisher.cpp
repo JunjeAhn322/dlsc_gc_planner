@@ -108,9 +108,41 @@ namespace MATP {
         }
     }
 
+    /**
+     * ===================================================================================
+     * [THEORY: Agent & Obstacle State Acquisition - Park et al. 2023/2025]
+     * ===================================================================================
+     *
+     * This function is the PRIMARY SENSOR INTERFACE for the planning pipeline.
+     * It acquires states for both the ego-agent and dynamic obstacles.
+     *
+     * PART 1 - AGENT STATE (Ego-localization):
+     *   - Listens to TF transform: world_frame -> agent_frame
+     *   - Updates observed_agent_position with current position
+     *   - Fallback: Use ideal (predicted) state if TF unavailable
+     *
+     * PART 2 - OBSTACLE STATE (Dynamic Obstacle Tracking):
+     *   - Listens to TF transform for each real dynamic obstacle
+     *   - Raw position is passed through Linear Kalman Filter (LKF)
+     *   - LKF estimates velocity from position-only measurements
+     *   - Output: Full state (position + velocity) for trajectory prediction
+     *
+     * [QUADRUPED ADAPTATION NOTE]:
+     * This is the injection point for custom state estimation:
+     * - Replace TF listener with EKF/UKF fusing IMU + leg odometry
+     * - For 2D navigation: extract (x, y, yaw) from full pose
+     * - Consider terrain height map for z-coordinate estimation
+     * ===================================================================================
+     */
     void CmdPublisher::listenTF() {
-        // Listen tf and get current position
-        // If there is no external pose update, then use ideal state of agent instead.
+        /**
+         * -------------------------------------------------------------------------------
+         * PART 1: AGENT STATE ACQUISITION (Ego-localization)
+         * -------------------------------------------------------------------------------
+         * Listen to TF and get agent's current position.
+         * If external pose update is unavailable, the planner will use the ideal
+         * (predicted) state from trajectory execution instead.
+         */
         tf::StampedTransform transform;
         try {
             tf_listener.lookupTransform(param.world_frame_id, "/cf" + std::to_string(mission.agents[agent_id].cid),
@@ -123,12 +155,23 @@ namespace MATP {
             external_agent_pose_update = false;
         }
 
-        // Listen tf and get real obstacle position
-        // If there is no external pose update, then use origin instead.
+        /**
+         * -------------------------------------------------------------------------------
+         * PART 2: DYNAMIC OBSTACLE STATE ACQUISITION (Obstacle Tracking + LKF)
+         * -------------------------------------------------------------------------------
+         * For each real dynamic obstacle:
+         * 1. Listen to TF transform for obstacle position (position-only measurement)
+         * 2. Pass raw position through Linear Kalman Filter
+         * 3. LKF estimates velocity using constant velocity motion model:
+         *      x_k+1 = F * x_k + w_k,  where x = [p, v]^T
+         * 4. Store filtered odometry (position + estimated velocity)
+         *
+         * The estimated velocity is CRITICAL for trajectory prediction phase:
+         *   p_future = p_current + v_estimated * t
+         */
         external_obs_pose_update = true;
         for(int oi = 0; oi < mission.on; oi++) {
             if (mission.obstacles[oi]->getType() == ObstacleType::DYN_REAL) {
-//                Obstacle obstacle = mission.obstacles[oi]->getObstacle(0);
 
                 geometry_msgs::PoseStamped obs_pose;
                 obs_pose.header.stamp = ros::Time::now();
@@ -147,6 +190,12 @@ namespace MATP {
                     external_obs_pose_update = false;
                 }
 
+                /**
+                 * [LKF VELOCITY ESTIMATION]
+                 * Linear Kalman Filter processes position measurement and outputs
+                 * full odometry (position + estimated velocity).
+                 * This is essential for constant-velocity trajectory prediction.
+                 */
                 nav_msgs::Odometry obs_odom = linear_kalman_filters[oi].pose_cb(obs_pose);
                 observed_obs_odoms.insert_or_assign(oi, obs_odom);
             }
